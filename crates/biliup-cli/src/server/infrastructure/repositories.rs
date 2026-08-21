@@ -212,9 +212,12 @@ pub async fn upsert_live_streamer_by_url(
         .change_context(AppError::Unknown)?
     {
         streamer.remark = payload.remark;
+        streamer.platform_id = payload.platform_id;
+        streamer.room_id = payload.room_id;
         streamer.filename_prefix = payload.filename_prefix;
         streamer.time_range = payload.time_range;
         streamer.upload_streamers_id = payload.upload_streamers_id;
+        streamer.is_only_self = payload.is_only_self;
         streamer.format = payload.format;
         streamer.override_cfg = payload.override_cfg;
         streamer.preprocessor = payload.preprocessor;

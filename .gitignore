@@ -32,6 +32,7 @@ cache/
 bili.cookie.json
 archive.txt
 /node_modules
+.npm-cache/
 watch_process.pid
 biliup/**/public
 *.xml

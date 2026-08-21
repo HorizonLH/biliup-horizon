@@ -65,6 +65,29 @@ mod tests {
     use super::ConnectionManager;
 
     #[tokio::test]
+    async fn live_platform_migration_keeps_legacy_visibility_nullable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+
+        sqlx::query("INSERT INTO livestreamers (url, remark, is_only_self) VALUES (?1, ?2, NULL)")
+            .bind("https://example.com/legacy")
+            .bind("legacy")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let visibility: Option<u8> =
+            sqlx::query_scalar("SELECT is_only_self FROM livestreamers WHERE remark = 'legacy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(visibility, None);
+    }
+
+    #[tokio::test]
     async fn identity_migration_fails_closed_on_multiple_existing_administrators() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("data.sqlite3");

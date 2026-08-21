@@ -100,7 +100,7 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
         <Form.Select.Option value="Noop">Noop</Form.Select.Option>
       </Form.Select>
       <Switch field="no_reprint" label="自制声明" />
-      <Switch field="is_only_self" label="仅自己可见" />
+      <Switch field="is_only_self" label="手动上传仅自己可见" />
       <Form.Switch field="charging_pay" label="开启充电面板" />
       <ArrayField field="credits">
         {({ add, arrayFields }) => (

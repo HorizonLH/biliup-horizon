@@ -111,6 +111,23 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                     ),
                 },
                 {
+                    itemKey: 'platforms',
+                    text: '平台维护',
+                    icon: (
+                        <div
+                            style={{
+                                backgroundColor: '#137c8b',
+                                borderRadius: 'var(--semi-border-radius-medium)',
+                                color: 'var(--semi-color-bg-0)',
+                                display: 'flex',
+                                padding: '4px',
+                            }}
+                        >
+                            <IconSetting size="small" />
+                        </div>
+                    ),
+                },
+                {
                     itemKey: 'archives',
                     text: 'B站稿件',
                     icon: (
@@ -225,6 +242,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             dashboard: '/dashboard',
             streamers: '/streamers',
             'upload-manager': '/upload-manager',
+            platforms: '/platforms',
             archives: '/archives',
             job: '/job',
             status: '/status',

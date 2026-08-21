@@ -8,6 +8,7 @@ use crate::server::infrastructure::models::InsertFileItem;
 use crate::server::infrastructure::models::hook_step::{
     HookStep, process_video, process_video_paths,
 };
+use crate::server::infrastructure::models::live_platform::LivePlatform;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use async_channel::Receiver;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
@@ -17,14 +18,17 @@ use biliup::error::Kind;
 use biliup::uploader::line::{Line, Probe};
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
-use error_stack::ResultExt;
+use error_stack::{ResultExt, bail};
 use futures::StreamExt;
 use futures::stream::Inspect;
-use ormlite::Insert;
+use ormlite::{Insert, Model};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::pin;
+use tokio::process::Command;
 use tracing::{error, info};
 
 // 辅助结构体
@@ -39,6 +43,19 @@ struct UploadContext {
 struct UploadedVideos {
     videos: Vec<Video>,
     paths: Vec<PathBuf>,
+    failed_segments: usize,
+}
+
+impl UploadedVideos {
+    fn ensure_complete(&self) -> AppResult<()> {
+        if self.failed_segments > 0 {
+            bail!(AppError::Custom(format!(
+                "{} 个分段转换或上传失败，取消投稿并保留本批次全部本地文件",
+                self.failed_segments
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub async fn process_with_upload<F>(
@@ -61,7 +78,37 @@ where
         .segment_processor
         .clone()
         .unwrap_or_default();
-    let uploaded_videos = pipeline_upload_videos(rx, &upload_context, &segment_processors).await?;
+    let platform = if let Some(platform_id) = ctx.live_streamer().platform_id {
+        LivePlatform::select()
+            .where_("id = ?")
+            .bind(platform_id)
+            .fetch_optional(ctx.pool())
+            .await
+            .change_context(AppError::Unknown)?
+    } else {
+        None
+    };
+    let is_audio_only = platform
+        .as_ref()
+        .is_some_and(|platform| platform.audio_only);
+    let audio_cover = platform
+        .filter(|platform| platform.audio_only)
+        .and_then(|platform| platform.cover_path.map(PathBuf::from));
+    if is_audio_only && audio_cover.is_none() {
+        info!(
+            platform_id = ctx.live_streamer().platform_id,
+            "音频流平台未配置转换封面，将使用黑色画面"
+        );
+    }
+    let uploaded_videos = pipeline_upload_videos(
+        rx,
+        &upload_context,
+        &segment_processors,
+        is_audio_only,
+        audio_cover.as_deref(),
+    )
+    .await?;
+    uploaded_videos.ensure_complete()?;
 
     // 3. 提交到B站
     if !uploaded_videos.videos.is_empty() {
@@ -73,6 +120,7 @@ where
             &upload_context.bilibili,
             uploaded_videos.videos,
             &recorder,
+            ctx.live_streamer().is_only_self,
         )
         .await?;
         let submit_api = ctx.config().submit_api.clone();
@@ -153,6 +201,8 @@ async fn pipeline_upload_videos<F>(
     rx: Inspect<Receiver<SegmentInfo>, F>,
     context: &UploadContext,
     segment_processors: &[HookStep],
+    is_audio_only: bool,
+    audio_cover: Option<&Path>,
 ) -> AppResult<UploadedVideos>
 where
     F: FnMut(&SegmentInfo),
@@ -162,16 +212,16 @@ where
     // 流式处理后续事件
     while let Some(event) = rx.next().await {
         // segment_processor 在上传前对路径列表做就地转换（如 Remux .ts→.mp4）。
-        // 单段失败（典型场景：磁盘满让 ffmpeg remux 写头失败）不应拖死整批——
-        // 否则已成功上传的段也无法到达 submit + postprocessor，本地 `rm` 不触发，
-        // 文件越堆越多，磁盘进一步紧张，形成正反馈。
+        // 任一分段处理失败都将整批标记为失败。循环仍继续消费接收器，避免阻塞录制端，
+        // 但批次不会投稿或执行后处理，确保本地源文件和转换文件全部保留。
         let mut paths = segment_paths(&event);
         if !segment_processors.is_empty()
             && let Err(e) = process_video_paths(&mut paths, segment_processors).await
         {
+            uploaded.failed_segments += 1;
             error!(
                 file = ?event.prev_file_path,
-                "segment_processor failed, skipping segment: {:?}", e
+                "segment_processor failed, preserving entire batch: {:?}", e
             );
             continue;
         }
@@ -179,24 +229,171 @@ where
             .first()
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
-        match upload_single_file(&upload_path, context).await {
+        let converted_path = if is_audio_only {
+            match convert_audio_to_video(&upload_path, audio_cover).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    uploaded.failed_segments += 1;
+                    error!(
+                        file = ?upload_path,
+                        error = ?e,
+                        "纯音频分段转换失败，跳过上传并保留本地文件"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let actual_upload_path = converted_path.as_deref().unwrap_or(&upload_path);
+        let upload_result = upload_single_file(actual_upload_path, context).await;
+        match upload_result {
             Ok(video) => {
                 uploaded.videos.push(video);
                 // 1.0.7 的 FileInfo(video, danmaku) 语义：上传完成后的 postprocessor
                 // 继续接收本段视频路径和对应弹幕路径。segment_processor 可能已把
                 // 首个视频路径原地替换（例如 Remux .ts→.mp4），因此这里保留转换后的路径集。
+                if let Some(converted_path) = converted_path {
+                    paths.push(converted_path);
+                }
                 uploaded.paths.extend(paths);
             }
             Err(e) => {
+                uploaded.failed_segments += 1;
                 error!(
-                    file = ?upload_path,
-                    "upload_single_file failed, skipping segment: {:?}", e
+                    file = ?actual_upload_path,
+                    "upload_single_file failed, preserving entire batch: {:?}", e
                 );
             }
         }
     }
 
     Ok(uploaded)
+}
+
+fn converted_audio_path(input: &Path) -> PathBuf {
+    static NEXT_CONVERSION_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_CONVERSION_ID.fetch_add(1, Ordering::Relaxed);
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    input.with_file_name(format!(
+        ".{stem}.biliup-audio-{}-{id}.tmp.mp4",
+        std::process::id()
+    ))
+}
+
+async fn convert_audio_to_video(
+    audio_path: &Path,
+    cover_path: Option<&Path>,
+) -> AppResult<PathBuf> {
+    let output_path = converted_audio_path(audio_path);
+    info!(
+        input = ?audio_path,
+        output = ?output_path,
+        cover = ?cover_path,
+        "开始将纯音频分段转换为视频，转换完成后将自动上传"
+    );
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error");
+    if let Some(cover_path) = cover_path {
+        command
+            .arg("-loop")
+            .arg("1")
+            .arg("-framerate")
+            .arg("2")
+            .arg("-i")
+            .arg(cover_path);
+    } else {
+        command
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("color=size=1280x720:color=black");
+    }
+    let output = command
+        .arg("-i")
+        .arg(audio_path)
+        .arg("-map")
+        .arg("1:a")
+        .arg("-map")
+        .arg("0:v")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-crf")
+        .arg("18")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("192k")
+        .arg("-shortest")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(&output_path)
+        .kill_on_drop(true)
+        .output()
+        .await;
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let metadata = tokio::fs::metadata(&output_path)
+                .await
+                .change_context_lazy(|| {
+                    AppError::Custom(format!(
+                        "ffmpeg 转换成功但输出文件不存在: {}",
+                        output_path.display()
+                    ))
+                })?;
+            if metadata.len() == 0 {
+                bail!(AppError::Custom(format!(
+                    "ffmpeg 生成了空文件: {}",
+                    output_path.display()
+                )));
+            }
+            info!(
+                input = ?audio_path,
+                output = ?output_path,
+                bytes = metadata.len(),
+                "音频流已转换为带封面的视频"
+            );
+            Ok(output_path)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                input = ?audio_path,
+                exit_code = output.status.code(),
+                stderr = %stderr.trim(),
+                "ffmpeg 音频转视频失败"
+            );
+            bail!(AppError::Custom(format!(
+                "ffmpeg 音频转视频失败（状态 {:?}）: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            error!(input = ?audio_path, "PATH 中未找到 ffmpeg，跳过该分段上传");
+            bail!(AppError::Custom(
+                "PATH 中未找到 ffmpeg，无法上传纯音频分段".into()
+            ));
+        }
+        Err(e) => {
+            error!(
+                input = ?audio_path,
+                error = ?e,
+                "无法启动 ffmpeg，跳过音频转视频"
+            );
+            Err(e).change_context(AppError::Custom("无法启动 ffmpeg 进行音频转视频".into()))
+        }
+    }
 }
 
 async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
@@ -301,6 +498,7 @@ pub(crate) async fn build_studio(
     bilibili: &BiliBili,
     videos: Vec<Video>,
     recorder: &Recorder,
+    is_only_self: Option<u8>,
 ) -> AppResult<Studio> {
     // 使用 Builder 模式简化构建
     let mut studio: Studio = Studio::builder()
@@ -324,7 +522,7 @@ pub(crate) async fn build_studio(
         .up_close_reply(upload_config.up_close_reply.unwrap_or_default())
         .up_selection_reply(upload_config.up_selection_reply.unwrap_or_default())
         .up_close_danmu(upload_config.up_close_danmu.unwrap_or_default())
-        .maybe_is_only_self(upload_config.is_only_self)
+        .maybe_is_only_self(is_only_self)
         .maybe_desc_v2(None)
         .extra_fields(
             serde_json::from_str(&upload_config.extra_fields.clone().unwrap_or_default())
@@ -449,6 +647,35 @@ mod tests {
         let event = SegmentInfo::new(video.clone(), Some(danmaku.clone()), None, 0);
 
         assert_eq!(segment_paths(&event), vec![video, danmaku]);
+    }
+
+    #[test]
+    fn converted_audio_path_keeps_the_original_stem() {
+        let first = converted_audio_path(Path::new("recording.flv"));
+        let second = converted_audio_path(Path::new("recording.flv"));
+
+        assert_ne!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".recording.biliup-audio-")
+        );
+        assert_eq!(first.extension().unwrap(), "mp4");
+        assert!(first.to_string_lossy().ends_with(".tmp.mp4"));
+    }
+
+    #[test]
+    fn failed_batch_is_not_eligible_for_submission_or_postprocessing() {
+        let complete = UploadedVideos::default();
+        assert!(complete.ensure_complete().is_ok());
+
+        let failed = UploadedVideos {
+            failed_segments: 1,
+            ..Default::default()
+        };
+        assert!(failed.ensure_complete().is_err());
     }
 
     const LIVE_URL: &str = "https://live.douyin.com/123456";

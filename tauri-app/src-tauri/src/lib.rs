@@ -1,7 +1,7 @@
 use std::env;
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, Manager, RunEvent};
 use tauri::path::BaseDirectory;
+use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
 use tauri_plugin_shell::ShellExt;
 
@@ -40,11 +40,12 @@ fn spawn_and_monitor_sidecar(app_handle: tauri::AppHandle) -> Result<(), String>
     //         }
     //     }
     // });
-    let resource_path = app_handle.path().resolve("binaries/biliup.exe", BaseDirectory::Resource).map_err(|e1| e1.to_string())?;
+    let resource_path = app_handle
+        .path()
+        .resolve("binaries/biliup.exe", BaseDirectory::Resource)
+        .map_err(|e1| e1.to_string())?;
     // Spawn sidecar
-    let sidecar_command = app_handle
-        .shell()
-        .command(resource_path);
+    let sidecar_command = app_handle.shell().command(resource_path).arg("server");
     // 获取当前可执行文件的路径
     let exe_path = env::current_exe().unwrap();
     // 获取可执行文件所在的目录

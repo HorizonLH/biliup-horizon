@@ -13,7 +13,12 @@ import { IconPlusCircle, IconMinusCircle } from '@douyinfe/semi-icons'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
 import React, { CSSProperties, useRef } from 'react'
 import { useState } from 'react'
-import { fetcher, LiveStreamerEntity, sendRequest, StudioEntity } from '../lib/api-streamer'
+import {
+  fetcher,
+  LivePlatformEntity,
+  LiveStreamerEntity,
+  StudioEntity,
+} from '../lib/api-streamer'
 import useSWR from 'swr'
 import useSWRMutation from 'swr/mutation'
 
@@ -76,9 +81,16 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     error,
     isLoading,
   } = useSWR<StudioEntity[]>('/v1/upload/streamers', fetcher)
+  const { data: platforms } = useSWR<LivePlatformEntity[]>('/v1/platforms', fetcher)
 
   const [visible, setVisible] = useState(false)
+  const [selectedPlatformId, setSelectedPlatformId] = useState<number | undefined>(
+    entity?.platform_id ?? undefined
+  )
+  const [roomId, setRoomId] = useState(entity?.room_id || '')
   const showDialog = () => {
+    setSelectedPlatformId(entity?.platform_id ?? undefined)
+    setRoomId(entity?.room_id || '')
     setVisible(true)
   }
   const handleOk = async () => {
@@ -86,9 +98,16 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     values = {
       ...values,
       remark: values?.remark?.trim(),
-      url: values?.url?.trim(),
+      room_id: values?.room_id?.trim(),
       format: values?.format?.trim(),
+      is_only_self: values?.is_only_self ? 1 : 0,
       time_range: JSON.stringify(values?.time_range?.map((date: Date) => date.toISOString())),
+    }
+    const platform = platforms?.find(item => item.id === values?.platform_id)
+    if (platform && values?.room_id) {
+      values.url = platform.url_template.replace('{room_id}', values.room_id)
+    } else {
+      values.url = values?.url?.trim()
     }
     await onOk(values)
     setVisible(false)
@@ -115,10 +134,19 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     }
   })
 
+  const platformList = platforms?.map(platform => ({
+    value: platform.id,
+    label: platform.name,
+  }))
+  const selectedPlatform = platforms?.find(platform => platform.id === selectedPlatformId)
+
+  const initValues: any = entity
+    ? { ...entity, is_only_self: entity.is_only_self === 1 }
+    : { is_only_self: false }
   try {
-    if (entity && entity.time_range && typeof entity.time_range === "string") {
-      const tr: string[] = JSON.parse(entity.time_range)
-      entity.time_range = tr.map(t => new Date(t))
+    if (initValues.time_range && typeof initValues.time_range === 'string') {
+      const tr: string[] = JSON.parse(initValues.time_range)
+      initValues.time_range = tr.map(t => new Date(t))
     }
   } catch (e) {
     console.error(e)
@@ -140,7 +168,7 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           paddingRight: 10,
         }}
       >
-        <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+        <Form initValues={initValues} getFormApi={formApi => (api.current = formApi)}>
           <Form.Input
             field="remark"
             label="录播备注"
@@ -148,12 +176,43 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
             rules={[{ required: true, message }]}
           />
 
-          <Form.Input
-            field="url"
-            label="直播链接"
-            trigger="blur"
-            rules={[{ required: true, message }]}
+          <Form.Select
+            field="platform_id"
+            label="直播平台"
+            placeholder="选择平台"
+            optionList={platformList}
+            filter
+            rules={[{ required: entity === undefined || entity.platform_id != null, message }]}
+            onChange={value => {
+              setSelectedPlatformId(value ? Number(value) : undefined)
+              if (value !== entity?.platform_id) {
+                api.current?.setValue('room_id', '')
+                setRoomId('')
+              }
+            }}
           />
+
+          {selectedPlatform ? (
+            <>
+              <Form.Input
+                field="room_id"
+                label="直播间 ID"
+                trigger="blur"
+                rules={[{ required: true, message }]}
+                onChange={value => setRoomId(value)}
+              />
+              <Form.Slot label="直播地址">
+                <Typography.Text type="tertiary" ellipsis={{ showTooltip: true }}>
+                  {selectedPlatform.url_template.replace(
+                    '{room_id}',
+                    roomId || '{room_id}'
+                  )}
+                </Typography.Text>
+              </Form.Slot>
+            </>
+          ) : entity?.url ? (
+            <Form.Input field="url" label="原直播链接" disabled />
+          ) : null}
 
           <Form.Input
               field="filename_prefix"
@@ -168,6 +227,8 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
             style={{ width: 176 }}
             optionList={list}
           />
+
+          <Form.Switch field="is_only_self" label="仅自己可见" />
 
           <ArrayField
             field="postprocessor"

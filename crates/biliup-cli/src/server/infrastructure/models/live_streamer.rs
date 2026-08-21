@@ -14,6 +14,10 @@ pub struct LiveStreamer {
     pub id: i64,
     /// 直播间URL
     pub url: String,
+    /// 关联的直播平台；历史配置可为空
+    pub platform_id: Option<i64>,
+    /// 平台直播间 ID；历史配置可为空
+    pub room_id: Option<String>,
     /// 备注名称
     pub remark: String,
     /// 文件名前缀
@@ -22,6 +26,8 @@ pub struct LiveStreamer {
     pub time_range: Option<String>,
     /// 关联的上传配置ID（外键，可空）
     pub upload_streamers_id: Option<i64>,
+    /// 自动投稿是否仅自己可见
+    pub is_only_self: Option<u8>,
     /// 录制格式
     pub format: Option<String>,
     /// 覆盖配置（"override"为关键字，字段名避让）
@@ -55,10 +61,13 @@ pub struct LiveStreamer {
 #[ormlite(returns = "LiveStreamer")]
 pub struct InsertLiveStreamer {
     pub url: String,
+    pub platform_id: Option<i64>,
+    pub room_id: Option<String>,
     pub remark: String,
     pub filename_prefix: Option<String>,
     pub time_range: Option<String>,
     pub upload_streamers_id: Option<i64>, // FK，可空
+    pub is_only_self: Option<u8>,
     pub format: Option<String>,
     #[ormlite(column = "override", json)]
     // “override” 是字段名，这里改为 override_cfg 避免与保留字混淆

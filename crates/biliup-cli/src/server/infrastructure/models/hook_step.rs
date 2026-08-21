@@ -379,12 +379,19 @@ impl HookStep {
     /// # 参数
     /// * `video_paths` - 要删除的视频文件路径列表
     pub(crate) async fn remove_file(video_paths: &[&Path]) -> AppResult<()> {
-        // 逐个删除视频文件
+        let mut failures = Vec::new();
         for video_path in video_paths {
             info!("删除 - Removing: {}", video_path.display());
-            fs::remove_file(video_path)
-                .await
-                .change_context(AppError::Unknown)?;
+            if let Err(error) = fs::remove_file(video_path).await {
+                error!(file = %video_path.display(), error = ?error, "删除后处理失败");
+                failures.push(format!("{}: {error}", video_path.display()));
+            }
+        }
+        if !failures.is_empty() {
+            bail!(AppError::Custom(format!(
+                "部分文件删除失败: {}",
+                failures.join("; ")
+            )));
         }
         Ok(())
     }
@@ -509,6 +516,19 @@ mod tests {
 
         assert!(!video.exists());
         assert!(!danmaku.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_attempts_all_paths_after_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.flv");
+        let existing = dir.path().join("converted.tmp.mp4");
+        std::fs::write(&existing, b"converted video").unwrap();
+
+        let result = HookStep::remove_file(&[missing.as_path(), existing.as_path()]).await;
+
+        assert!(result.is_err(), "任一删除失败时应向调用方报告错误");
+        assert!(!existing.exists(), "前一个路径失败后仍应尝试删除后续路径");
     }
 
     /// 复现 pipeline_upload_videos 的 fault-tolerance 触发条件：

@@ -1,5 +1,6 @@
 /// 钩子步骤模块
 pub mod hook_step;
+pub mod live_platform;
 pub mod live_streamer;
 pub mod upload_streamer;
 

@@ -220,14 +220,20 @@ export default function Home() {
                 >
                   <div style={{ position: 'absolute', right: 20, top: 9 }}>{item.statusTag}</div>
 
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      {item.upload_status === "Pending" ? <Badge count={<IconUpload />}> </Badge> : null}
-
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      paddingTop: 14,
+                    }}
+                  >
                     <h3
                       style={{
                         color: 'var(--semi-color-text-0)',
                         fontWeight: 500,
-                        maxWidth: '80%',
+                        minWidth: 0,
+                        flex: 1,
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap',
@@ -235,7 +241,20 @@ export default function Home() {
                     >
                       {item.remark}
                     </h3>
-
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                      {item.upload_status === 'Pending' ? (
+                        <Badge count={<IconUpload />}> </Badge>
+                      ) : null}
+                      {item.is_only_self === 1 ? (
+                        <Tag
+                          color="grey"
+                          style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                        >
+                          <IconLock size="small" />
+                          仅自己可见
+                        </Tag>
+                      ) : null}
+                    </div>
                   </div>
 
                   <Text style={{ width: '101%' }} ellipsis={{ showTooltip: true }} type="tertiary">

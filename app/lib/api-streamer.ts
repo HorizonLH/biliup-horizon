@@ -95,6 +95,8 @@ export interface StudioEntity {
 export interface LiveStreamerEntity {
 	id: number;
 	url: string;
+	platform_id?: number | null;
+	room_id?: string | null;
 	remark: string;
 	filename: string;
 	split_time?: number;
@@ -102,6 +104,8 @@ export interface LiveStreamerEntity {
 	upload_id?: number;
 	status?: string;
 	upload_status?: string;
+	upload_streamers_id?: number | null;
+	is_only_self?: number | null;
 	statusTag?: React.ReactNode;
 	format?: string;
     time_range?: string | Date[];
@@ -112,6 +116,14 @@ export interface LiveStreamerEntity {
 	postprocessor?: (Record<'run' | 'mv', string> | 'rm')[];
 	opt_args?: string[];
 	override?: Record<string, any>;
+}
+
+export interface LivePlatformEntity {
+	id: number;
+	name: string;
+	url_template: string;
+	audio_only: boolean;
+	cover_path?: string | null;
 }
 
 export interface BiliType {

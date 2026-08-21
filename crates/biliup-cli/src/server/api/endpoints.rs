@@ -6,6 +6,9 @@ use crate::server::errors::{AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Stage, WorkerStatus};
 use crate::server::infrastructure::dto::LiveStreamerResponse;
+use crate::server::infrastructure::models::live_platform::{
+    InsertLivePlatform, LivePlatform, ROOM_ID_PLACEHOLDER,
+};
 use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
 use crate::server::infrastructure::models::upload_streamer::{
     InsertUploadStreamer, UploadStreamer,
@@ -34,6 +37,202 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::fs;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+fn validation_response(message: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, message.into()).into_response()
+}
+
+fn normalize_platform(platform: &mut InsertLivePlatform) -> Result<(), Response> {
+    platform.name = platform.name.trim().to_string();
+    platform.url_template = platform.url_template.trim().to_string();
+    platform.cover_path = platform
+        .cover_path
+        .take()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty());
+    if !platform.audio_only {
+        platform.cover_path = None;
+    }
+
+    if platform.name.is_empty() {
+        return Err(validation_response("平台名称不能为空"));
+    }
+    if !platform.url_template.starts_with("http://")
+        && !platform.url_template.starts_with("https://")
+    {
+        return Err(validation_response(
+            "直播地址模板必须以 http:// 或 https:// 开头",
+        ));
+    }
+    if platform.url_template.matches(ROOM_ID_PLACEHOLDER).count() != 1 {
+        return Err(validation_response(format!(
+            "直播地址模板必须且只能包含一个 {ROOM_ID_PLACEHOLDER}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod platform_validation_tests {
+    use super::{InsertLivePlatform, normalize_platform};
+    use axum::http::StatusCode;
+
+    fn platform(url_template: &str, audio_only: bool) -> InsertLivePlatform {
+        InsertLivePlatform {
+            id: None,
+            name: " Example ".into(),
+            url_template: url_template.into(),
+            audio_only,
+            cover_path: Some(" cover.jpg ".into()),
+        }
+    }
+
+    #[test]
+    fn non_audio_platform_discards_conversion_cover() {
+        let mut platform = platform("https://example.com/{room_id}", false);
+
+        normalize_platform(&mut platform).unwrap();
+
+        assert_eq!(platform.name, "Example");
+        assert_eq!(platform.cover_path, None);
+    }
+
+    #[test]
+    fn template_requires_exactly_one_room_placeholder() {
+        for template in [
+            "https://example.com/live",
+            "https://example.com/{room_id}/{room_id}",
+        ] {
+            let mut platform = platform(template, true);
+            assert_eq!(
+                normalize_platform(&mut platform).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+}
+
+async fn ensure_platform_name_available(
+    pool: &ConnectionPool,
+    name: &str,
+    current_id: Option<i64>,
+) -> Result<(), Response> {
+    let existing = LivePlatform::select()
+        .where_("name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    if existing.is_some_and(|platform| Some(platform.id) != current_id) {
+        return Err((StatusCode::CONFLICT, "平台名称已存在").into_response());
+    }
+    Ok(())
+}
+
+async fn resolve_platform_room_url(
+    pool: &ConnectionPool,
+    platform_id: i64,
+    room_id: Option<&str>,
+) -> Result<(String, String), Response> {
+    let room_id = room_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| validation_response("选择平台后必须填写直播间 ID"))?;
+    let platform = LivePlatform::select()
+        .where_("id = ?")
+        .bind(platform_id)
+        .fetch_optional(pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?
+        .ok_or_else(|| validation_response("所选平台不存在"))?;
+    Ok((platform.room_url(room_id), room_id.to_string()))
+}
+
+pub async fn get_live_platforms_endpoint(
+    State(pool): State<ConnectionPool>,
+) -> Result<Json<Vec<LivePlatform>>, Response> {
+    let platforms = LivePlatform::select()
+        .order_asc("name")
+        .fetch_all(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    Ok(Json(platforms))
+}
+
+pub async fn post_live_platform_endpoint(
+    State(pool): State<ConnectionPool>,
+    Json(mut platform): Json<InsertLivePlatform>,
+) -> Result<Json<LivePlatform>, Response> {
+    platform.id = None;
+    normalize_platform(&mut platform)?;
+    ensure_platform_name_available(&pool, &platform.name, None).await?;
+    let platform = ormlite::Insert::insert(platform, &pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    Ok(Json(platform))
+}
+
+pub async fn put_live_platform_endpoint(
+    State(pool): State<ConnectionPool>,
+    Json(mut platform): Json<InsertLivePlatform>,
+) -> Result<Json<LivePlatform>, Response> {
+    let id = platform
+        .id
+        .ok_or_else(|| validation_response("更新平台时缺少 ID"))?;
+    normalize_platform(&mut platform)?;
+    ensure_platform_name_available(&pool, &platform.name, Some(id)).await?;
+    platform
+        .update_all_fields(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    let updated = LivePlatform::select()
+        .where_("id = ?")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    Ok(Json(updated))
+}
+
+pub async fn delete_live_platform_endpoint(
+    State(pool): State<ConnectionPool>,
+    Path(id): Path<i64>,
+) -> Result<Json<()>, Response> {
+    let references: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM livestreamers WHERE platform_id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .change_context(AppError::Unknown)
+            .map_err(report_to_response)?;
+    if references > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("该平台仍被 {references} 个直播配置使用，不能删除"),
+        )
+            .into_response());
+    }
+    let platform = LivePlatform::select()
+        .where_("id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "平台不存在").into_response())?;
+    platform
+        .delete(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    Ok(Json(()))
+}
 
 pub async fn get_streamers_endpoint(
     State(pool): State<ConnectionPool>,
@@ -68,8 +267,16 @@ pub async fn post_streamers_endpoint(
     State(service_register): State<ServiceRegister>,
     State(managers): State<Arc<DownloadManager>>,
     State(pool): State<ConnectionPool>,
-    Json(payload): Json<InsertLiveStreamer>,
+    Json(mut payload): Json<InsertLiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
+    if let Some(platform_id) = payload.platform_id {
+        let (url, room_id) =
+            resolve_platform_room_url(&pool, platform_id, payload.room_id.as_deref()).await?;
+        payload.url = url;
+        payload.room_id = Some(room_id);
+    } else if payload.url.trim().is_empty() {
+        return Err(validation_response("直播链接不能为空"));
+    }
     let url = &payload.url.clone();
     // You can insert the model directly.
     let live_streamers = payload
@@ -96,8 +303,16 @@ pub async fn put_streamers_endpoint(
     State(service_register): State<ServiceRegister>,
     State(managers): State<Arc<DownloadManager>>,
     State(pool): State<ConnectionPool>,
-    Json(payload): Json<LiveStreamer>,
+    Json(mut payload): Json<LiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
+    if let Some(platform_id) = payload.platform_id {
+        let (url, room_id) =
+            resolve_platform_room_url(&pool, platform_id, payload.room_id.as_deref()).await?;
+        payload.url = url;
+        payload.room_id = Some(room_id);
+    } else if payload.url.trim().is_empty() {
+        return Err(validation_response("直播链接不能为空"));
+    }
     let streamer = payload
         .update_all_fields(&pool)
         .await
@@ -675,7 +890,14 @@ pub async fn post_uploads(
                         "",
                     ),
                 );
-                let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
+                let studio = build_studio(
+                    &upload_config,
+                    &bilibili,
+                    videos,
+                    &recorder,
+                    upload_config.is_only_self,
+                )
+                .await?;
                 submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
                 info!(template_id = upload_config.id, "通过页面上传成功");
             }

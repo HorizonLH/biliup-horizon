@@ -331,10 +331,13 @@ fn to_live_streamer_insert(
 ) -> AppResult<InsertLiveStreamer> {
     Ok(InsertLiveStreamer {
         url: url.to_string(),
+        platform_id: None,
+        room_id: None,
         remark: remark.to_string(),
         filename_prefix: streamer.filename_prefix.clone(),
         time_range: streamer.time_range.clone(),
         upload_streamers_id,
+        is_only_self: streamer.is_only_self,
         format: streamer.format.clone(),
         override_cfg: streamer
             .override_cfg
